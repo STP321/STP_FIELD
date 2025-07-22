@@ -1,6 +1,9 @@
-streamlit
-pandas
-plotly
+streamlit~=1.46.1
+pandas~=2.3.0
+plotly~=6.2.0
 xlsxwriter
 openpyxl
-fpdf
+fpdf~=1.7.2
+matplotlib~=3.10.3
+pillow~=11.2.1
+kaleido

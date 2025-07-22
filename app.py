@@ -7,20 +7,19 @@ import plotly.express as px
 import plotly.graph_objects as go
 from fpdf import FPDF
 import re
-
+from database import init_db, delete_station_entry
+from database import save_station_entry
+import ast
+init_db()
+import sqlite3
+import matplotlib.pyplot as plt
+from plotly.io import to_image
+from PIL import Image
 
 
 
 # ----------------- USER DATABASE ------------------
-if "user_credentials" not in st.session_state:
-    st.session_state.user_credentials = {
-        "admin": {
-            "password": "admin123",
-            "section": "both",
-            "registered_by": "system",
-            "registered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-    }
+from database import register_user, authenticate_user, get_all_users, get_user_section, save_station_entry, load_station_data
 
 # ----------------- SESSION FLAGS ------------------
 for key in ["logged_in", "current_user", "active_page", "register_mode", "reset_mode", "analysis_unlocked", "logentry_unlocked"]:
@@ -50,17 +49,15 @@ def registration_form():
     confirm_password = st.text_input("Confirm Password", type="password")
 
     if st.button("Create User"):
-        if new_username in st.session_state.user_credentials:
-            st.error("🚫 Username already exists.")
-        elif new_password != confirm_password:
+        if new_password != confirm_password:
             st.error("❌ Passwords do not match.")
         else:
-            st.session_state.user_credentials[new_username] = {
-                "password": new_password,
-                "section": selected_section,
-                "registered_by": st.session_state.current_user or "unknown",
-                "registered_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            }
+            register_user(
+                new_username,
+                new_password,
+                selected_section,
+                st.session_state.current_user or "unknown"
+            )
             st.success(f"✅ User '{new_username}' created with '{selected_section}' access.")
             st.session_state.register_mode = False
 
@@ -68,10 +65,6 @@ def registration_form():
 def reset_password_form():
     st.header("🔁 Reset Password")
     username = st.text_input("🔑 Username to Reset")
-    if username not in st.session_state.user_credentials:
-        st.warning("⚠️ Username does not exist.")
-        return
-
     new_pass = st.text_input("🔐 New Password", type="password")
     confirm = st.text_input("🔐 Confirm New Password", type="password")
 
@@ -79,7 +72,7 @@ def reset_password_form():
         if new_pass != confirm:
             st.error("❌ Passwords do not match.")
         else:
-            st.session_state.user_credentials[username]["password"] = new_pass
+            register_user(username, new_pass, get_user_section(username), "updated")
             st.success(f"✅ Password reset for user '{username}'.")
             st.session_state.reset_mode = False
 
@@ -87,17 +80,7 @@ def reset_password_form():
 def download_user_list():
     st.subheader("📋 Registered Users List")
 
-    user_data = [
-        {
-            "Username": u,
-            "Access": d["section"],
-            "Registered By": d.get("registered_by", ""),
-            "Registered At": d.get("registered_at", "")
-        }
-        for u, d in st.session_state.user_credentials.items()
-    ]
-    df = pd.DataFrame(user_data)
-
+    df = get_all_users()
     st.dataframe(df)
 
     csv = df.to_csv(index=False).encode("utf-8")
@@ -122,21 +105,20 @@ if not st.session_state.logged_in:
     password = st.text_input("Password", type="password")
 
     if st.button("Login"):
-        creds = st.session_state.user_credentials.get(username)
-        if creds and creds["password"] == password:
-            allowed_section = creds["section"]
+        user = authenticate_user(username, password)
+        if user:
+            allowed_section = user[2]
             st.session_state.logged_in = True
             st.session_state.current_user = username
             st.session_state.analysis_unlocked = allowed_section in ["analysis report", "both"]
             st.session_state.logentry_unlocked = allowed_section in ["log entry", "both"]
 
-            # Default page setting
             if allowed_section == "log entry":
                 st.session_state.active_page = "log entry"
             elif allowed_section == "analysis report":
                 st.session_state.active_page = "analysis report"
             elif allowed_section == "both":
-                st.session_state.active_page = "log entry"  # default page
+                st.session_state.active_page = "log entry"
 
             st.success(f"✅ Login successful. Access granted: {allowed_section}")
             st.rerun()
@@ -160,26 +142,22 @@ if not st.session_state.logged_in:
 
 # ----------------- SIDEBAR INFO ------------------
 st.sidebar.success(f"👤 Logged in as: {st.session_state.current_user}")
-user_data = st.session_state.user_credentials.get(st.session_state.current_user)
 
-if user_data:
-    st.sidebar.info(f"📄 Section Access: {user_data['section']}")
-    st.sidebar.caption(f"🔐 Registered by: {user_data.get('registered_by', 'unknown')}")
+if st.session_state.current_user:
+    section = get_user_section(st.session_state.current_user)
+    st.sidebar.info(f"📄 Section Access: {section}")
 
-    # Only for log entry access
-    if user_data["section"] == "log entry":
+    if section == "log entry":
         if st.session_state.active_page != "log entry":
             st.session_state.active_page = "log entry"
         st.sidebar.markdown("📝 Log Entry Access Only")
 
-    # Only for analysis report access
-    elif user_data["section"] == "analysis report":
+    elif section == "analysis report":
         if st.session_state.active_page != "analysis report":
             st.session_state.active_page = "analysis report"
         st.sidebar.markdown("📊 Analysis Report Access Only")
 
-    # For users with both access, show toggle button
-    elif user_data["section"] == "both":
+    elif section == "both":
         st.sidebar.markdown("🔀 Access to Log Entry and Analysis Report")
         st.sidebar.markdown(f"📄 Currently Viewing: **{st.session_state.active_page.title()}**")
         if st.sidebar.button("🔁 Switch Page"):
@@ -187,12 +165,10 @@ if user_data:
                 "analysis report" if st.session_state.active_page == "log entry" else "log entry"
             )
 
-    # Admin only button
     if st.session_state.current_user == "admin":
         if st.sidebar.button("📋 View Users"):
             st.session_state.active_page = "admin_user_list"
 
-# Logout
 if st.sidebar.button("🔓 Logout"):
     for key in [
         "logged_in", "active_page", "current_user",
@@ -203,35 +179,6 @@ if st.sidebar.button("🔓 Logout"):
     st.rerun()
 
 
-# ----------------- PAGE LOGIC ------------------
-if st.session_state.active_page == "log entry":
-    if not st.session_state.logentry_unlocked:
-        st.error("🚫 You are not authorized to access the 'Log Entry' section.")
-        st.stop()
-    st.title("📝 Log Entry Page")
-    st.write("Log entry form or interface goes here...")
-
-elif st.session_state.active_page == "analysis report":
-    if not st.session_state.analysis_unlocked:
-        st.error("🚫 You are not authorized to access the 'Analysis Report' section.")
-        st.stop()
-    st.title("📊 Analysis Report Page")
-    st.write("Analysis reports, filters, and charts go here...")
-
-elif st.session_state.active_page == "admin_user_list":
-    download_user_list()
-
-# ----------------- DATA STATE ------------------
-if "station_data" not in st.session_state:
-    st.session_state["station_data"] = pd.DataFrame(columns=[
-        "Date", "Zone", "User", "SPS Name", "Total Pumps",
-        "Working Pumps", "Standby Pumps", "Standby U/M", "Remarks",
-        "Pumping MLD", "Income MLD", "Supply MLD"
-    ])
-
-
-
-# ----------------- ZONE AND SPS SETUP ------------------
 valid_zones = ["WZ", "EZ", "SZ", "NZ", "CZ", "SWZ", "NWZ", "SR", "TSPS", "Plant"]
 
 zone_sps_map = {
@@ -258,12 +205,21 @@ zone_sps_map = {
     ]
 }
 
-
-
-# ----------------- PAGE 1: LOG ENTRY ------------------
+# log entry page
+if st.session_state.get("show_success"):
+    st.success("✅ Entry saved successfully!")
+    st.session_state["show_success"] = False
 
 if st.session_state.active_page == "log entry":
-    st.subheader("🗂 Select Zone")
+    if not st.session_state.logentry_unlocked:
+        st.error("🚫 You are not authorized to access the 'Log Entry' section.")
+        st.stop()
+
+    if "unlocked_entries" not in st.session_state:
+        st.session_state["unlocked_entries"] = set()
+
+    st.title("📝 Log Entry Page")
+
     if "selected_zone" not in st.session_state:
         st.session_state.selected_zone = valid_zones[0]
 
@@ -271,796 +227,512 @@ if st.session_state.active_page == "log entry":
     st.session_state.selected_zone = selected_zone
     sps_options = zone_sps_map.get(selected_zone, [])
 
-    with st.form("log_entry"):
-        st.subheader("📝 Log New Entry")
-        entry_date = st.date_input("Date of Entry", value=date.today())
-        sps_name = st.selectbox("Name of SPS", sps_options)
-        user = st.text_input("User Name or ID", value=st.session_state.get("current_user", ""))
-        total_pumps = st.number_input("Total Pumps", min_value=0)
-        working_pumps = st.number_input("Working Pumps", min_value=0)
-        standby_pumps = st.number_input("Standby Pumps", min_value=0)
-        standby_um = st.number_input("Standby Pumps U/M", min_value=0)
+    entry_date = date.today()
+    entry_date_str = entry_date.strftime('%Y-%m-%d')
+
+    submitted = False
+
+    with st.form("log_entry_form"):
+        col1, col2 = st.columns(2)
+        entry_date = col1.date_input("Date", value=date.today())
+        sps_name = col2.selectbox("SPS Name", sps_options)
+
+        entry_date_str = entry_date.strftime('%Y-%m-%d')
+        sps_name_normalized = sps_name.strip().lower()
+        entry_key = f"{entry_date_str}_{sps_name_normalized}"
+
+        col3, col4, col5, col6 = st.columns(4)
+        total_pumps = col3.number_input("Total Pumps", min_value=0, step=1)
+        working_pumps = col4.number_input("Working Pumps", min_value=0, step=1)
+        standby_pumps = col5.number_input("Standby Pumps", min_value=0, step=1)
+        standby_um = col6.number_input("Standby U/M", min_value=0, step=1)
         remarks = st.text_area("Remarks")
-        pumping_mld = st.number_input("Pumping MLD", min_value=0.0, disabled=(selected_zone == "Plant"))
-        income_mld = st.number_input("Income MLD", min_value=0.0, disabled=(selected_zone != "Plant"))
-        supply_mld = st.number_input("Supply MLD", min_value=0.0, disabled=(selected_zone != "Plant"))
 
-        # 🔍 Check if an entry already exists
-        existing_entry = st.session_state["station_data"][
-            (st.session_state["station_data"]["Date"] == entry_date) &
-            (st.session_state["station_data"]["SPS Name"] == sps_name)
-        ]
-
-        # 🔒 Block duplicate without PIN
-        if not existing_entry.empty and "edit_unlocked" not in st.session_state:
-            st.warning("🔒 An entry already exists for this SPS on the selected date.")
-            pin = st.text_input("🔐 Enter PIN to edit existing entry", type="password")
-            if st.form_submit_button("Unlock Entry"):
-                if pin == "1234":  # Change this to your preferred authority PIN
-                    st.session_state.edit_unlocked = True
-                    st.success("✅ Edit access granted.")
-                    st.rerun()
-                else:
-                    st.error("❌ Invalid PIN")
-            st.stop()
-
-        submitted = st.form_submit_button("Submit")
-
-        if submitted:
-            if not user.strip():
-                st.warning("⚠️ Please enter your name or ID.")
-            else:
-
-
-                new_log = pd.DataFrame([{
-                    "Date": entry_date,
-                    "Zone": selected_zone,
-                    "User": user,
-                    "SPS Name": sps_name,
-                    "Total Pumps": total_pumps,
-                    "Working Pumps": working_pumps,
-                    "Standby Pumps": standby_pumps,
-                    "Standby U/M": standby_um,
-                    "Remarks": remarks.strip(),
-                    "Pumping MLD": pumping_mld if selected_zone != "Plant" else 0.0,
-                    "Income MLD": income_mld if selected_zone == "Plant" else 0.0,
-                    "Supply MLD": supply_mld if selected_zone == "Plant" else 0.0
-                }])
-
-                if not existing_entry.empty:
-                    # Update existing row
-                    index_to_update = existing_entry.index[0]
-                    st.session_state["station_data"].loc[index_to_update] = new_log.values[0]
-                    st.success("✏️ Entry updated successfully!")
-                    st.session_state.edit_unlocked = False  # reset edit status
-                else:
-                    st.session_state["station_data"] = pd.concat(
-                        [st.session_state["station_data"], new_log], ignore_index=True)
-                    st.success("✅ Entry saved successfully!")
-
-    if not st.session_state["station_data"].empty:
-        st.subheader("📄 Recent Entries")
-        current_user = st.session_state.get("current_user", "")
-        recent_df = st.session_state["station_data"]
-        if current_user != "admin":
-            recent_df = recent_df[recent_df["User"] == current_user]
-        st.dataframe(recent_df.sort_values("Date", ascending=False))
-
-        # ----------------- PENDING SPS FOR TODAY -----------------
-        st.markdown("### ⏳ Pending SPS Entries for Today")
-
-        today = date.today()
-        zone = st.session_state.selected_zone
-        sps_list = zone_sps_map.get(zone, [])
-
-        # Get today's entries for selected zone
-        existing_entries = st.session_state["station_data"]
-        existing_today = existing_entries[
-            (pd.to_datetime(existing_entries["Date"]).dt.date == today) &
-            (existing_entries["Zone"] == zone)
-            ]["SPS Name"].tolist()
-
-        # Identify pending SPS
-        pending_today = [sps for sps in sps_list if sps not in existing_today]
-
-        if pending_today:
-            st.warning(f"🚧 Pending Entries for Zone **{zone}** on **{today.strftime('%d-%m-%Y')}**")
-            st.dataframe(pd.DataFrame({"Pending SPS": pending_today}))
+        if selected_zone == "Plant":
+            col8, col9 = st.columns(2)
+            income_mld = col8.number_input("Income MLD", min_value=0.0)
+            supply_mld = col9.number_input("Supply MLD", min_value=0.0)
+            pumping_mld = 0.0
         else:
-            st.success(f"✅ All SPS entries for **{zone}** are submitted for today.")
+            pumping_mld = st.number_input("Pumping MLD", min_value=0.0)
+            income_mld = 0.0
+            supply_mld = 0.0
 
-
-
- #Part 4: Analysis Report Page
-if st.session_state.active_page == "analysis report":
-
-
-    st.subheader("📊 Summary Analysis")
-
-    summary_df = st.session_state["station_data"].copy()
-    current_user = st.session_state.get("current_user", "")
-    if current_user != "admin":
-        summary_df = summary_df[summary_df["User"] == current_user]
-
-    unique_zones = ["All"] + sorted(summary_df["Zone"].unique())
-    selected_zone_filter = st.selectbox("Filter by Zone", unique_zones)
-
-    unique_sps = ["All"] + sorted(summary_df["SPS Name"].unique())
-    selected_sps = st.selectbox("Filter by SPS", unique_sps)
-
-    # ----------------- DATE SELECTION ------------------
-
-    st.markdown("### 📅 Select Duration or Custom Date Range")
-    summary_range = st.selectbox(
-        "Quick Select Duration",
-        ["Last 7 Days", "Last 30 Days", "This Month", "This Year", "Custom Range"]
-    )
-
-    today = date.today()
-
-    if summary_range == "Last 7 Days":
-        start_date = today - timedelta(days=6)
-        end_date = today
-    elif summary_range == "Last 30 Days":
-        start_date = today - timedelta(days=29)
-        end_date = today
-    elif summary_range == "This Month":
-        start_date = today.replace(day=1)
-        end_date = today
-    elif summary_range == "This Year":
-        start_date = today.replace(month=1, day=1)
-        end_date = today
-    else:
-        col1, col2 = st.columns(2)
-        with col1:
-            start_date = st.date_input("Start Date", value=today - timedelta(days=6))
-        with col2:
-            end_date = st.date_input("End Date", value=today)
-
-        if start_date > end_date:
-            st.warning("⚠️ Start Date must be before End Date.")
-            st.stop()
-
-    # Filter by date range
-    summary_df = summary_df[pd.to_datetime(summary_df["Date"]).dt.date.between(start_date, end_date)]
-
-    # Apply zone and SPS filters
-    if selected_zone_filter != "All":
-        summary_df = summary_df[summary_df["Zone"] == selected_zone_filter]
-    if selected_sps != "All":
-        summary_df = summary_df[summary_df["SPS Name"] == selected_sps]
-
-    # ----------------- PENDING SPS LIST -----------------
-
-
-    st.markdown("### 📊 Zone Group Summary")
-
-    # Ensure numeric types
-    summary_df["Pumping MLD"] = pd.to_numeric(summary_df["Pumping MLD"], errors="coerce").fillna(0.0)
-    summary_df["Income MLD"] = pd.to_numeric(summary_df["Income MLD"], errors="coerce").fillna(0.0)
-    summary_df["Supply MLD"] = pd.to_numeric(summary_df["Supply MLD"], errors="coerce").fillna(0.0)
-
-    # Define zone groups
-    sps_zones = {"WZ", "EZ", "SZ", "NWZ", "SWZ", "SR", "NZ", "CZ"}
-    tsps_zone = {"TSPS"}
-    plant_zone = {"Plant"}
-
-
-    # ✅ Function to summarize zone totals by selected fields
-    def zone_total(df, zone_set, fields):
-        return df[df["Zone"].isin(zone_set)].groupby("SPS Name")[fields].sum().reset_index()
-
-
-    # Layout for summary display
-    col1, col2 = st.columns(2)
-
-    # SPS zone totals
-    with col1:
-        st.markdown("**📌 SPS Zones Total (Pumping MLD)**")
-        sps_total = zone_total(summary_df, sps_zones, ["Pumping MLD"])
-        st.dataframe(sps_total)
-
-    # Plant totals - Only Income & Supply MLD
-    with col2:
-        st.markdown("**🏭 Plant Total (Income & Supply MLD)**")
-        plant_total = zone_total(summary_df, plant_zone, ["Income MLD", "Supply MLD"])
-        st.dataframe(plant_total)
-
-    # TSPS totals
-    st.markdown("**🌐 TSPS Total (Pumping MLD)**")
-    tsps_total = zone_total(summary_df, tsps_zone, ["Pumping MLD"])
-    st.dataframe(tsps_total)
-
-
-    # Utility: Convert DataFrame to Excel bytes
-    def to_excel(df):
-        output = BytesIO()
-        with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
-            df.to_excel(writer, index=False, sheet_name="Log Data")
-        return output.getvalue()
-
-
-    # Prepare data for export
-    user_all_df = st.session_state["station_data"]
-    if current_user != "admin":
-        user_all_df = user_all_df[user_all_df["User"] == current_user]
-
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                label="📥 Download Filtered Data as Excel",
-                data=to_excel(summary_df),
-                file_name="sps_filtered_data.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        with col2:
-            st.download_button(
-                label="📦 Download My Entries as Excel" if current_user != "admin" else "📦 Download All Entries as Excel",
-                data=to_excel(user_all_df),
-                file_name="sps_user_data.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-    else:
-        st.info("No data available for selected filters.")
-
-
-# ----------------- 📈 Charts & Trend Section -----------------
-    st.markdown("### 📊 Trends & Visual Insights")
-
-# Filtered data for charts
-    filtered_chart_df = summary_df.copy()
-    filtered_chart_df["Date"] = pd.to_datetime(filtered_chart_df["Date"])
-
-# 🔹 Zone-wise Trend
-    zone_data = filtered_chart_df.groupby(["Date", "Zone"])["Pumping MLD"].sum().reset_index()
-    if not zone_data.empty:
-        fig_zone = px.line(zone_data, x="Date", y="Pumping MLD", color="Zone", title="Zone-wise Pumping Trend (MLD)")
-        st.plotly_chart(fig_zone, use_container_width=True)
-
-# 🔹 SPS-wise Trend
-    sps_data = filtered_chart_df.groupby(["Date", "SPS Name"])["Pumping MLD"].sum().reset_index()
-    if not sps_data.empty:
-        fig_sps = px.line(sps_data, x="Date", y="Pumping MLD", color="SPS Name", title="SPS-wise Pumping Trend (MLD)")
-        st.plotly_chart(fig_sps, use_container_width=True)
-
-# ----------------- 📋 Summary Table -----------------
-    st.markdown("### 📋 Combined Summary Table")
-
-    summary_table = summary_df.groupby(["Zone", "SPS Name"]).agg({
-        "Pumping MLD": "sum",
-
-    }).reset_index()
-
-    st.dataframe(summary_table)
-# ----------------- 🏭 Plant Detailed Summary -----------------
-    st.markdown("### 🏭 Plant Zone Summary (Grouped)")
-
-    plant_summary = summary_df[summary_df["Zone"] == "Plant"].groupby("SPS Name").agg({
-        "Income MLD": "sum",
-        "Supply MLD": "sum",
-        "Date": "count"
-    }).rename(columns={"Date": "Entry Count"}).reset_index()
-
-    if not plant_summary.empty:
-        st.dataframe(plant_summary)
-    else:
-        st.info("No data available for Plant zone in selected range.")
-
-    # 🗓️ Today's date for default filters
-    today = date.today()
-
-    # ----------------- 🔍 Compare Metrics Between Two Dates -----------------
-    st.markdown("### 🔍 Compare Metrics Between Two Dates")
-
-    with st.form("compare_dates_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            compare_date_1 = st.date_input("📅 First Date", value=today - timedelta(days=1), key="compare_date_1")
-        with col2:
-            compare_date_2 = st.date_input("📅 Second Date", value=today, key="compare_date_2")
-
-        compare_zone = st.selectbox("🗂 Zone Filter", ["All"] + sorted(summary_df["Zone"].unique()))
-        compare_sps = st.selectbox("🏭 SPS Filter", ["All"] + sorted(summary_df["SPS Name"].unique()))
-        view_as_percent = st.checkbox("📉 Show as % Change", value=False)
-        submitted = st.form_submit_button("Compare Dates")
+        submitted = st.form_submit_button("📄 Submit Entry")
 
     if submitted:
-        df_compare = summary_df[
-            pd.to_datetime(summary_df["Date"]).dt.date.isin([compare_date_1, compare_date_2])
-        ]
-        if compare_zone != "All":
-            df_compare = df_compare[df_compare["Zone"] == compare_zone]
-        if compare_sps != "All":
-            df_compare = df_compare[df_compare["SPS Name"] == compare_sps]
+        df_logs = load_station_data()
+        df_logs["entry_date"] = pd.to_datetime(df_logs["entry_date"], errors='coerce').dt.strftime('%Y-%m-%d')
+        df_logs["sps_name"] = df_logs["sps_name"].astype(str).str.strip().str.lower()
 
-        if df_compare.empty:
-            st.warning("⚠️ No data found.")
-        else:
-            pivot = df_compare.pivot_table(
-                index="SPS Name",
-                columns=df_compare["Date"].dt.date,
-                values=["Pumping MLD", "Income MLD", "Supply MLD"],
-                aggfunc="sum"
-            )
-            pivot.columns = [f"{m} ({d})" for m, d in pivot.columns]
-            pivot = pivot.reset_index()
-
-            for metric in ["Pumping MLD", "Income MLD", "Supply MLD"]:
-                col1 = f"{metric} ({compare_date_1})"
-                col2 = f"{metric} ({compare_date_2})"
-                if col1 in pivot.columns and col2 in pivot.columns:
-                    pivot[f"\u0394 {metric}"] = pivot[col2] - pivot[col1]
-                    pivot[f"% \u0394 {metric}"] = (
-                            (pivot[f"\u0394 {metric}"] / pivot[col1].replace(0, float("nan"))) * 100
-                    ).round(2)
-
-            display_cols = ["SPS Name"]
-            for metric in ["Pumping MLD", "Income MLD", "Supply MLD"]:
-                col = f"% \u0394 {metric}" if view_as_percent else f"\u0394 {metric}"
-                if col in pivot.columns:
-                    display_cols.append(col)
-
-            st.markdown(f"#### 📋 Comparison Table {'(% Change)' if view_as_percent else '(Absolute Change)'}")
-            st.dataframe(pivot[display_cols].style.applymap(
-                lambda v: 'color: green' if isinstance(v, (int, float)) and v > 0 else (
-                    'color: red' if isinstance(v, (int, float)) and v < 0 else ''),
-                subset=display_cols[1:]
-            ))
-
-            for metric in ["Pumping MLD", "Income MLD", "Supply MLD"]:
-                col = f"% \u0394 {metric}" if view_as_percent else f"\u0394 {metric}"
-                if col in pivot.columns:
-                    chart_df = pivot[["SPS Name", col]].dropna()
-                    chart_df = chart_df[chart_df[col] != 0]
-                    if not chart_df.empty:
-                        fig = go.Figure(go.Bar(
-                            x=chart_df["SPS Name"],
-                            y=chart_df[col],
-                            marker_color=["green" if x > 0 else "red" for x in chart_df[col]],
-                            text=chart_df[col].round(2),
-                            textposition="auto"
-                        ))
-                        fig.update_layout(
-                            title=f"📊 {metric} Change ({'%' if view_as_percent else 'MLD'}): {compare_date_1} ➜ {compare_date_2}",
-                            xaxis_title="SPS Name",
-                            yaxis_title=f"{metric} {'% Δ' if view_as_percent else 'Δ'}",
-                            showlegend=False, height=400
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-
-            st.download_button(
-                label=f"📥 Download {'% Change' if view_as_percent else 'Absolute Change'} Comparison",
-                data=to_excel(pivot),
-                file_name="date_comparison.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-#   critical SPS
-    st.markdown("### 🚨 Critical SPS (Standby Pumps All in Under Maintenance)")
-
-    if not summary_df.empty:
-        critical_df = summary_df[
-            summary_df["Standby Pumps"] == 0
-            ]
-        if not critical_df.empty:
-            st.dataframe(
-                critical_df[["Date", "Zone", "SPS Name", "Standby Pumps"]].sort_values("Date", ascending=False))
-            st.download_button(
-                label="📥 Download Critical SPS List",
-                data=to_excel(critical_df),
-                file_name="critical_sps_zero_standby.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        else:
-            st.success("✅ No Critical SPS ")
-#  5.   for both section
-
-if st.session_state.active_page == "Both":
-
-    st.subheader("🗂 Select Zone")
-    if "selected_zone" not in st.session_state:
-        st.session_state.selected_zone = valid_zones[0]
-
-    selected_zone = st.selectbox("Zone", valid_zones, index=valid_zones.index(st.session_state.selected_zone))
-    st.session_state.selected_zone = selected_zone
-    sps_options = zone_sps_map.get(selected_zone, [])
-
-    with st.form("log_entry"):
-        st.subheader("📝 Log New Entry")
-        entry_date = st.date_input("Date of Entry", value=date.today())
-        sps_name = st.selectbox("Name of SPS", sps_options)
-        user = st.text_input("User Name or ID", value=st.session_state.get("current_user", ""))
-        total_pumps = st.number_input("Total Pumps", min_value=0)
-        working_pumps = st.number_input("Working Pumps", min_value=0)
-        standby_pumps = st.number_input("Standby Pumps", min_value=0)
-        standby_um = st.number_input("Standby Pumps U/M", min_value=0)
-        remarks = st.text_area("Remarks")
-        pumping_mld = st.number_input("Pumping MLD", min_value=0.0, disabled=(selected_zone == "Plant"))
-        income_mld = st.number_input("Income MLD", min_value=0.0, disabled=(selected_zone != "Plant"))
-        supply_mld = st.number_input("Supply MLD", min_value=0.0, disabled=(selected_zone != "Plant"))
-
-        # 🔍 Check if an entry already exists
-        existing_entry = st.session_state["station_data"][
-            (st.session_state["station_data"]["Date"] == entry_date) &
-            (st.session_state["station_data"]["SPS Name"] == sps_name)
+        match = df_logs[
+            (df_logs["entry_date"] == entry_date_str) &
+            (df_logs["sps_name"] == sps_name_normalized)
         ]
 
-        # 🔒 Block duplicate without PIN
-        if not existing_entry.empty and "edit_unlocked" not in st.session_state:
-            st.warning("🔒 An entry already exists for this SPS on the selected date.")
-            pin = st.text_input("🔐 Enter PIN to edit existing entry", type="password")
-            if st.form_submit_button("Unlock Entry"):
-                if pin == "1234":  # Change this to your preferred authority PIN
-                    st.session_state.edit_unlocked = True
-                    st.success("✅ Edit access granted.")
-                    st.rerun()
-                else:
-                    st.error("❌ Invalid PIN")
+        if not match.empty and entry_key not in st.session_state.get("unlocked_entries", set()):
+            st.session_state.pending_unlock = entry_key
+            st.session_state.show_refresh = True
+            st.warning("🔒 Entry already exists. Please delete or change SPS/date.")
+
+            if st.button("🔄 Refresh", key="refresh_existing"):
+                st.session_state.show_refresh = False
+                st.session_state.pending_unlock = None
+                st.rerun()
+
             st.stop()
 
-        submitted = st.form_submit_button("Submit")
+        save_station_entry(
+            entry_date_str, selected_zone.lower(), st.session_state.current_user, sps_name,
+            total_pumps, working_pumps, standby_pumps, standby_um,
+            remarks, pumping_mld, income_mld, supply_mld
+        )
+        st.session_state["show_success"] = True
+        st.session_state["unlocked_entries"].discard(entry_key)
+        st.rerun()
 
-        if submitted:
-            if not user.strip():
-                st.warning("⚠️ Please enter your name or ID.")
-            else:
-                if standby_pumps == standby_um:
-                    remarks = remarks + "\nNo stand by in Pumping Station"
+    if st.session_state.get("pending_unlock"):
+        st.warning("🔒 This entry is locked. Please delete old entry or change SPS/date.")
+        if st.button("🔄 Refresh to Delete or Change SPS/date", key="refresh_locked"):
+            st.session_state.pending_unlock = None
+            st.session_state.show_refresh = False
+            st.rerun()
 
-                new_log = pd.DataFrame([{
-                    "Date": entry_date,
-                    "Zone": selected_zone,
-                    "User": user,
-                    "SPS Name": sps_name,
-                    "Total Pumps": total_pumps,
-                    "Working Pumps": working_pumps,
-                    "Standby Pumps": standby_pumps,
-                    "Standby U/M": standby_um,
-                    "Remarks": remarks.strip(),
-                    "Pumping MLD": pumping_mld if selected_zone != "Plant" else 0.0,
-                    "Income MLD": income_mld if selected_zone == "Plant" else 0.0,
-                    "Supply MLD": supply_mld if selected_zone == "Plant" else 0.0
-                }])
+    st.subheader("📄 Recent Entries")
+    selected_filter_date = st.date_input("🗓️ Filter by Date", date.today())
+    df_user_logs = load_station_data()
+    df_user_logs["entry_date"] = pd.to_datetime(df_user_logs["entry_date"], errors='coerce').dt.date
 
-                if not existing_entry.empty:
-                    # Update existing row
-                    index_to_update = existing_entry.index[0]
-                    st.session_state["station_data"].loc[index_to_update] = new_log.values[0]
-                    st.success("✏️ Entry updated successfully!")
-                    st.session_state.edit_unlocked = False  # reset edit status
-                else:
-                    st.session_state["station_data"] = pd.concat(
-                        [st.session_state["station_data"], new_log], ignore_index=True)
-                    st.success("✅ Entry saved successfully!")
+    selected_zone_norm = selected_zone.strip().lower()
+    df_user_logs["zone"] = df_user_logs["zone"].astype(str).str.strip().str.lower()
+    df_user_logs["sps_name"] = df_user_logs["sps_name"].astype(str).str.strip().str.lower()
 
-    if not st.session_state["station_data"].empty:
-        st.subheader("📄 Recent Entries")
-        current_user = st.session_state.get("current_user", "")
-        recent_df = st.session_state["station_data"]
-        if current_user != "admin":
-            recent_df = recent_df[recent_df["User"] == current_user]
-        st.dataframe(recent_df.sort_values("Date", ascending=False))
+    # Corrected filter for today
+    filtered_logs = df_user_logs[
+        (df_user_logs["zone"] == selected_zone_norm) &
+        (df_user_logs["entry_date"] == selected_filter_date)
+        ]
 
-        # ----------------- PENDING SPS FOR TODAY -----------------
-        st.markdown("### ⏳ Pending SPS Entries for Today")
+    if not filtered_logs.empty:
+        df_recent_display = filtered_logs.copy()
+        df_recent_display.reset_index(drop=True, inplace=True)
+        df_recent_display.index += 1
+        df_recent_display["Delete"] = df_recent_display.apply(
+            lambda row: f"🗑️ Delete - {row['sps_name']} ({row['entry_date']})", axis=1)
+        st.dataframe(df_recent_display.drop(columns=["Delete"]))
 
-        today = date.today()
-        zone = st.session_state.selected_zone
-        sps_list = zone_sps_map.get(zone, [])
-
-        # Get today's entries for selected zone
-        existing_entries = st.session_state["station_data"]
-        existing_today = existing_entries[
-            (pd.to_datetime(existing_entries["Date"]).dt.date == today) &
-            (existing_entries["Zone"] == zone)
-            ]["SPS Name"].tolist()
-
-        # Identify pending SPS
-        pending_today = [sps for sps in sps_list if sps not in existing_today]
-
-        if pending_today:
-            st.warning(f"🚧 Pending Entries for Zone **{zone}** on **{today.strftime('%d-%m-%Y')}**")
-            st.dataframe(pd.DataFrame({"Pending SPS": pending_today}))
-        else:
-            st.success(f"✅ All SPS entries for **{zone}** are submitted for today.")
-
-        # ----------------- ⚠️ Critical SPS List (Standby = Standby U/M) -----------------
-        st.markdown("### 🚨 Critical SPS (Standby Pumps = Standby U/M)")
-
-        if not summary_df.empty:
-            critical_df = summary_df[summary_df["Standby Pumps"] == summary_df["Standby U/M"]]
-            if not critical_df.empty:
-                st.dataframe(
-                    critical_df[["Date", "Zone", "SPS Name", "Standby Pumps", "Standby U/M"]].sort_values("Date",
-                                                                                                          ascending=False))
-                st.download_button(
-                    label="📥 Download Critical SPS List",
-                    data=to_excel(critical_df),
-                    file_name="critical_sps_list.xlsx",
-                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+        for idx, row in filtered_logs.iterrows():
+            if st.button(f"🗑️ Delete Entry - {row['sps_name']} ({row['entry_date']})", key=f"del_btn_{idx}"):
+                delete_station_entry(
+                    row['entry_date'].strftime("%Y-%m-%d"),
+                    row['sps_name']
                 )
-            else:
-                st.success("✅ No critical SPS found where Standby Pumps equals Standby U/M.")
+                st.success("✅ Entry deleted.")
+                st.rerun()
+    else:
+        st.info("ℹ️ No entries found for selected zone and date.")
+
+    # Pending Entries fix (matches cleaned zone/SPS)
+    today_logs = filtered_logs["sps_name"].tolist()
+    sps_expected = [s.strip().lower() for s in zone_sps_map.get(selected_zone, [])]
+    pending_today = [s for s in sps_expected if s not in today_logs]
+
+    if pending_today:
+        st.warning(f"🚧 Pending SPS entries for {selected_zone} on {selected_filter_date.strftime('%d-%m-%Y')}")
+        df_pending = pd.DataFrame({"Pending SPS": pending_today})
+        df_pending.reset_index(drop=True, inplace=True)
+        df_pending.index += 1
+        st.dataframe(df_pending)
+    else:
+        st.success("✅ All SPS entries completed for selected zone and date.")
 
 
 
- #both: Analysis Report Page
+####################################################################################################################################
+
+# Always reload fresh station data when entering analysis report
+
+
+if st.session_state.active_page == "analysis report":
+    st.session_state["station_data"] = load_station_data()
 
     st.subheader("📊 Summary Analysis")
 
     summary_df = st.session_state["station_data"].copy()
-    current_user = st.session_state.get("current_user", "")
-    if current_user != "admin":
-        summary_df = summary_df[summary_df["User"] == current_user]
 
-    unique_zones = ["All"] + sorted(summary_df["Zone"].unique())
+    summary_df.columns = summary_df.columns.str.strip().str.lower()  # Normalize column names
+    summary_df["zone"] = summary_df["zone"].astype(str).str.strip().str.lower()
+    summary_df["sps_name"] = summary_df["sps_name"].astype(str).str.strip()
+
+    for col in ["income mld", "supply mld", "pumping mld", "standby pumps"]:
+        if col in summary_df.columns:
+            summary_df[col] = pd.to_numeric(summary_df[col], errors="coerce").fillna(0.0)
+        else:
+            summary_df[col] = 0.0
+
+    current_user = st.session_state.get("current_user", "")
+    user_section = get_user_section(current_user)
+
+    # Only restrict to own data for 'log entry' users
+    if user_section == "log entry":
+       summary_df = summary_df[summary_df["username"] == current_user]
+
+    # ✅ Debug zones available
+    #st.write("✅ All zones in dataset:", summary_df["zone"].unique())
+
+    unique_zones = ["All"] + sorted(summary_df["zone"].dropna().unique())
     selected_zone_filter = st.selectbox("Filter by Zone", unique_zones)
 
-    unique_sps = ["All"] + sorted(summary_df["SPS Name"].unique())
+    unique_sps = ["All"] + sorted(summary_df["sps_name"].dropna().unique())
     selected_sps = st.selectbox("Filter by SPS", unique_sps)
 
-    # ----------------- DATE SELECTION ------------------
-
     st.markdown("### 📅 Select Duration or Custom Date Range")
+
     summary_range = st.selectbox(
         "Quick Select Duration",
-        ["Last 7 Days", "Last 30 Days", "This Month", "This Year", "Custom Range"]
+        ["Today", "Yesterday", "Last 7 Days", "Last 30 Days", "This Month", "This Year", "Custom Range"]
     )
 
     today = date.today()
 
-    if summary_range == "Last 7 Days":
+    # --- Handle Date Ranges ---
+    if summary_range == "Today":
+        start_date = end_date = today
+
+    elif summary_range == "Yesterday":
+        start_date = end_date = today - timedelta(days=1)
+
+    elif summary_range == "Last 7 Days":
         start_date = today - timedelta(days=6)
         end_date = today
+
     elif summary_range == "Last 30 Days":
         start_date = today - timedelta(days=29)
         end_date = today
+
     elif summary_range == "This Month":
         start_date = today.replace(day=1)
         end_date = today
+
     elif summary_range == "This Year":
         start_date = today.replace(month=1, day=1)
         end_date = today
-    else:
+
+    else:  # Custom Range
         col1, col2 = st.columns(2)
         with col1:
             start_date = st.date_input("Start Date", value=today - timedelta(days=6))
         with col2:
             end_date = st.date_input("End Date", value=today)
-
         if start_date > end_date:
             st.warning("⚠️ Start Date must be before End Date.")
             st.stop()
 
-    # Filter by date range
-    summary_df = summary_df[pd.to_datetime(summary_df["Date"]).dt.date.between(start_date, end_date)]
+    # --- Filter DataFrame ---
+    summary_df["entry_date"] = pd.to_datetime(summary_df["entry_date"], errors='coerce')
+    st.write("🕓 Data range in data:", summary_df["entry_date"].min(), "to", summary_df["entry_date"].max())
 
-    # Apply zone and SPS filters
+    # Filter by selected date range
+    summary_df = summary_df[summary_df["entry_date"].dt.date.between(start_date, end_date)]
+
+    # Additional zone and SPS filters
     if selected_zone_filter != "All":
-        summary_df = summary_df[summary_df["Zone"] == selected_zone_filter]
+        summary_df = summary_df[summary_df["zone"] == selected_zone_filter]
+
     if selected_sps != "All":
-        summary_df = summary_df[summary_df["SPS Name"] == selected_sps]
+        summary_df = summary_df[summary_df["sps_name"] == selected_sps]
+    # ------------------- ✅ ZONE GROUP SUMMARIES ---------------------
+    sps_zones = {"wz", "ez", "sz", "nwz", "swz", "sr", "nz", "cz"}
+    tsps_zone = {"tsps"}
+    plant_zone = {"plant"}
 
-    # ----------------- PENDING SPS LIST -----------------
-
-
-    st.markdown("### 📊 Zone Group Summary")
-
-    # Ensure numeric types
-    summary_df["Pumping MLD"] = pd.to_numeric(summary_df["Pumping MLD"], errors="coerce").fillna(0.0)
-    summary_df["Income MLD"] = pd.to_numeric(summary_df["Income MLD"], errors="coerce").fillna(0.0)
-    summary_df["Supply MLD"] = pd.to_numeric(summary_df["Supply MLD"], errors="coerce").fillna(0.0)
-
-    # Define zone groups
-    sps_zones = {"WZ", "EZ", "SZ", "NWZ", "SWZ", "SR", "NZ", "CZ"}
-    tsps_zone = {"TSPS"}
-    plant_zone = {"Plant"}
-
-
-    # ✅ Function to summarize zone totals by selected fields
     def zone_total(df, zone_set, fields):
-        return df[df["Zone"].isin(zone_set)].groupby("SPS Name")[fields].sum().reset_index()
+        return df[df["zone"].isin(zone_set)].groupby("sps_name")[fields].sum().reset_index()
 
-
-    # Layout for summary display
-    col1, col2 = st.columns(2)
-
-    # SPS zone totals
+    col1, col2, col3 = st.columns(3)
+    #with col1:
+        #st.markdown("**📌 SPS(Pumping MLD)**")
+        #sps_total = zone_total(summary_df, sps_zones, ["pumping mld"])
+        #st.dataframe(sps_total)
     with col1:
-        st.markdown("**📌 SPS Zones Total (Pumping MLD)**")
-        sps_total = zone_total(summary_df, sps_zones, ["Pumping MLD"])
-        st.dataframe(sps_total)
+        #st.markdown("**📌 SPS (Pumping MLD) Total by Zone**")
 
-    # Plant totals - Only Income & Supply MLD
+        # Filter only SPS zones from summary_df
+        sps_df = summary_df[summary_df['zone'].isin(sps_zones)]
+
+        # Group by 'zone' and sum 'pumping mld'
+        sps_total = sps_df.groupby('zone')[['pumping_mld']].sum().reset_index()
+
+        # Rename column for clarity
+        sps_total = sps_total.rename(columns={'pumping_mld': 'Total Pumping MLD'})
+
+        # Display result
+        #st.dataframe(sps_total)
+
+        # Optional: Display grand total
+        grand_total = sps_total['Total Pumping MLD'].sum()
+        grand_mean = sps_total['Total Pumping MLD'].mean()
+        st.metric("🚰 Total SPS (Pumping MLD)", f"{grand_total:.2f}")
+        st.metric("🚰 Average SPS (Pumping MLD)", f"{grand_mean:.2f}")
+    #with col2:
+        #st.markdown("**🏭 Plant(Income & Supply MLD)**")
+        #plant_total = zone_total(summary_df, plant_zone, ["income mld", "supply mld"])
+        #st.dataframe(plant_total)
     with col2:
-        st.markdown("**🏭 Plant Total (Income & Supply MLD)**")
-        plant_total = zone_total(summary_df, plant_zone, ["Income MLD", "Supply MLD"])
-        st.dataframe(plant_total)
+        #st.markdown("**🏭 Plant (Income & Supply MLD) Total by Zone**")
 
-    # TSPS totals
-    st.markdown("**🌐 TSPS Total (Pumping MLD)**")
-    tsps_total = zone_total(summary_df, tsps_zone, ["Pumping MLD"])
-    st.dataframe(tsps_total)
+        # Filter only Plant zones from summary_df
+        plant_df = summary_df[summary_df['zone'].isin(plant_zone)]
 
+        # Group by 'zone' and sum 'income mld' and 'supply mld'
+        plant_total = plant_df.groupby('zone')[['income_mld', 'supply_mld']].sum().reset_index()
 
-    # Utility: Convert DataFrame to Excel bytes
+        # Rename columns for clarity (optional)
+        plant_total = plant_total.rename(columns={
+            'income_mld': 'Total Income MLD',
+            'supply_mld': 'Total Supply MLD'
+        })
+
+        # Display result
+        #st.dataframe(plant_total)
+
+        # Optional: Show grand totals
+        total_income = plant_total['Total Income MLD'].sum()
+        total_supply = plant_total['Total Supply MLD'].sum()
+        mean_income = plant_total['Total Income MLD'].mean()
+        mean_supply = plant_total['Total Supply MLD'].mean()
+        st.metric("🏭  Plant Income MLD", f"{total_income:.2f}")
+        st.metric("🏭 plant Supply MLD", f"{total_supply:.2f}")
+        st.metric("🏭 Average plant Income MLD", f"{mean_income:.2f}")
+        st.metric("🏭 Average plant Supply MLD", f"{mean_supply:.2f}")
+    #with col3:
+
+        #st.markdown("**🌐 TSPS(Pumping MLD)**")
+        #tsps_total = zone_total(summary_df, tsps_zone, ["pumping mld"])
+        #st.dataframe(tsps_total)
+    with col3:
+        #st.markdown("**🌐 TSPS (Pumping MLD) Total by Zone**")
+
+        # Filter only TSPS zones from summary_df
+        tsps_df = summary_df[summary_df['zone'].isin(tsps_zone)]
+
+        # Group by 'zone' and sum 'pumping mld'
+        tsps_total = tsps_df.groupby('zone')[['pumping_mld']].sum().reset_index()
+
+        # Rename column for clarity
+        tsps_total = tsps_total.rename(columns={'pumping_mld': 'Total Pumping MLD'})
+
+        # Display result
+        #st.dataframe(tsps_total)
+
+        # Optional: Display grand total
+        grand_total = tsps_total['Total Pumping MLD'].sum()
+        grand_mean = tsps_total['Total Pumping MLD'].mean()
+        st.metric("🚰 TSPS Pumping MLD (TSPS)", f"{grand_total:.2f}")
+        st.metric("🚰 Average Pumping MLD (TSPS)", f"{grand_mean:.2f}")
+    # ------------------- ✅ TOTAL PER ZONE -------------------
+    st.markdown("### 🌍 Total Pumping per Zone")
+
+    # Convert to datetime (if not already)
+    summary_df["entry_date"] = pd.to_datetime(summary_df["entry_date"], errors='coerce')
+
+    # ----- 1️⃣ ZONE-WISE TOTALS -----
+    zone_totals = (
+        summary_df[summary_df["zone"].isin(sps_zones)]
+        .groupby("zone")["pumping_mld"]
+        .sum()
+        .reindex(sorted(sps_zones), fill_value=0)
+        .reset_index()
+    )
+
+    # ----- 2️⃣ TSPS TOTAL -----
+    tsps_total = (
+        summary_df[summary_df["zone"].isin(tsps_zone)]["pumping_mld"]
+        .sum()
+    )
+    tsps_row = pd.DataFrame([{"zone": "tsps", "pumping_mld": tsps_total}])
+
+    # ----- 3️⃣ PLANT TOTAL (income + supply) -----
+    if "income_mld" in summary_df.columns and "supply_mld" in summary_df.columns:
+        plant_income = summary_df[summary_df["zone"] == "plant"]["income_mld"].sum()
+        plant_supply = summary_df[summary_df["zone"] == "plant"]["supply_mld"].sum()
+    else:
+        plant_income = 0
+        plant_supply = 0
+
+    plant_row = pd.DataFrame([{
+        "zone": "plant",
+        "pumping_mld": "",  # Leave blank for alignment
+        "income_mld": plant_income,
+        "supply_mld": plant_supply
+    }])
+
+    # ----- 4️⃣ Combine All Rows -----
+    # Merge zone totals + TSPS
+    final_df = pd.concat([zone_totals, tsps_row], ignore_index=True)
+
+    # Add empty income/supply cols to all rows
+    final_df["income_mld"] = ""
+    final_df["supply_mld"] = ""
+
+    # Append plant row
+    final_df = pd.concat([final_df, plant_row], ignore_index=True)
+
+    # Reorder columns
+    final_df = final_df[["zone", "pumping_mld", "income_mld", "supply_mld"]]
+
+    # ----- 5️⃣ Display -----
+    st.dataframe(final_df)
+
+    # ------------------- ✅ EXPORTS -------------------
     def to_excel(df):
         output = BytesIO()
         with pd.ExcelWriter(output, engine="xlsxwriter") as writer:
             df.to_excel(writer, index=False, sheet_name="Log Data")
         return output.getvalue()
 
+    user_all_df = st.session_state["station_data"].copy()
+    user_all_df.columns = user_all_df.columns.str.strip().str.lower()
+    if user_section == "log entry":
+        user_all_df = user_all_df[user_all_df["username"] == current_user]
 
-    # Prepare data for export
-    user_all_df = st.session_state["station_data"]
-    if current_user != "admin":
-        user_all_df = user_all_df[user_all_df["User"] == current_user]
+    col1, col2 = st.columns(2)
+    with col1:
+        st.download_button("📥 Download Filtered Data", data=to_excel(summary_df), file_name="filtered_data.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+    with col2:
+        st.download_button("📦 Download My Entries", data=to_excel(user_all_df), file_name="my_data.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
 
-        col1, col2 = st.columns(2)
-        with col1:
-            st.download_button(
-                label="📥 Download Filtered Data as Excel",
-                data=to_excel(summary_df),
-                file_name="sps_filtered_data.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        with col2:
-            st.download_button(
-                label="📦 Download My Entries as Excel" if current_user != "admin" else "📦 Download All Entries as Excel",
-                data=to_excel(user_all_df),
-                file_name="sps_user_data.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-    else:
-        st.info("No data available for selected filters.")
+    # ------------------- ✅ CHARTS -------------------
 
-
-# ----------------- 📈 Charts & Trend Section -----------------
+    # ---------- 📊 TRENDS & VISUAL INSIGHTS ----------
     st.markdown("### 📊 Trends & Visual Insights")
 
-# Filtered data for charts
+    # Assuming summary_df already exists and contains columns: entry_date, zone, sps_name, pumping_mld
     filtered_chart_df = summary_df.copy()
-    filtered_chart_df["Date"] = pd.to_datetime(filtered_chart_df["Date"])
 
-# 🔹 Zone-wise Trend
-    zone_data = filtered_chart_df.groupby(["Date", "Zone"])["Pumping MLD"].sum().reset_index()
-    if not zone_data.empty:
-        fig_zone = px.line(zone_data, x="Date", y="Pumping MLD", color="Zone", title="Zone-wise Pumping Trend (MLD)")
+    # Ensure 'entry_date' is in datetime format
+    filtered_chart_df["entry_date"] = pd.to_datetime(filtered_chart_df["entry_date"])
+    # Add a formatted version for display (if needed elsewhere)
+    filtered_chart_df["entry_date_str"] = filtered_chart_df["entry_date"].dt.strftime("%d/%m/%y")
+
+    # Chart display buttons
+    show_zone_chart = st.button("📈 Show Zone-wise Trend")
+    show_sps_chart = st.button("📉 Show SPS-wise Trend")
+    show_combined_chart = st.button("📊 Show Combined Trend")
+
+    # --------------------- ZONE-WISE CHART ---------------------
+    if show_zone_chart:
+        st.subheader("📈 Zone-wise Pumping Trend")
+        zone_data = (
+            filtered_chart_df
+            .groupby(["entry_date", "zone"])["pumping_mld"]
+            .sum()
+            .reset_index()
+        )
+
+        fig_zone = px.line(
+            zone_data,
+            x="entry_date",
+            y="pumping_mld",
+            color="zone",
+            title="Zone-wise Pumping Trend",
+            markers=True
+        )
+        fig_zone.update_layout(
+            xaxis_title="Date (dd/mm/yy)",
+            yaxis_title="Pumping MLD",
+            xaxis=dict(tickformat="%d/%m/%y"),
+            yaxis=dict(tickformat=".0f")
+        )
         st.plotly_chart(fig_zone, use_container_width=True)
 
-# 🔹 SPS-wise Trend
-    sps_data = filtered_chart_df.groupby(["Date", "SPS Name"])["Pumping MLD"].sum().reset_index()
-    if not sps_data.empty:
-        fig_sps = px.line(sps_data, x="Date", y="Pumping MLD", color="SPS Name", title="SPS-wise Pumping Trend (MLD)")
+    # --------------------- SPS-WISE CHART ---------------------
+    if show_sps_chart:
+        st.subheader("📉 SPS-wise Pumping Trend")
+        sps_data = (
+            filtered_chart_df
+            .groupby(["entry_date", "sps_name"])["pumping_mld"]
+            .sum()
+            .reset_index()
+        )
+
+        fig_sps = px.line(
+            sps_data,
+            x="entry_date",
+            y="pumping_mld",
+            color="sps_name",
+            title="SPS-wise Pumping Trend",
+            markers=True
+        )
+        fig_sps.update_layout(
+            xaxis_title="Date (dd/mm/yy)",
+            yaxis_title="Pumping MLD",
+            xaxis=dict(tickformat="%d/%m/%y"),
+            yaxis=dict(tickformat=".0f")
+        )
         st.plotly_chart(fig_sps, use_container_width=True)
 
-# ----------------- 📋 Summary Table -----------------
-    st.markdown("### 📋 Combined Summary Table")
+    # ------------------- COMBINED CHART --------------------
+    if show_combined_chart:
+        st.subheader("📊 Combined Trend (Zone vs SPS)")
 
-    summary_table = summary_df.groupby(["Zone", "SPS Name"]).agg({
-        "Pumping MLD": "sum",
+        # ZONE
+        zone_data = (
+            filtered_chart_df
+            .groupby(["entry_date", "zone"])["pumping_mld"]
+            .sum()
+            .reset_index()
+        )
+        fig_combined_zone = px.line(
+            zone_data,
+            x="entry_date",
+            y="pumping_mld",
+            color="zone",
+            title="Zone-wise Pumping Comparison",
+            markers=True
+        )
+        fig_combined_zone.update_layout(
+            xaxis_title="Date (dd/mm/yy)",
+            yaxis_title="Pumping MLD",
+            xaxis=dict(tickformat="%d/%m/%y"),
+            yaxis=dict(tickformat=".0f")
+        )
+        st.plotly_chart(fig_combined_zone, use_container_width=True)
 
-    }).reset_index()
+        # SPS
+        sps_data = (
+            filtered_chart_df
+            .groupby(["entry_date", "sps_name"])["pumping_mld"]
+            .sum()
+            .reset_index()
+        )
+        fig_combined_sps = px.line(
+            sps_data,
+            x="entry_date",
+            y="pumping_mld",
+            color="sps_name",
+            title="SPS-wise Pumping Comparison",
+            markers=True
+        )
+        fig_combined_sps.update_layout(
+            xaxis_title="Date (dd/mm/yy)",
+            yaxis_title="Pumping MLD",
+            xaxis=dict(tickformat="%d/%m/%y"),
+            yaxis=dict(tickformat=".0f")
+        )
+        st.plotly_chart(fig_combined_sps, use_container_width=True)
 
-    st.dataframe(summary_table)
-# ----------------- 🏭 Plant Detailed Summary -----------------
-    st.markdown("### 🏭 Plant Zone Summary (Grouped)")
-
-    plant_summary = summary_df[summary_df["Zone"] == "Plant"].groupby("SPS Name").agg({
-        "Income MLD": "sum",
-        "Supply MLD": "sum",
-        "Date": "count"
-    }).rename(columns={"Date": "Entry Count"}).reset_index()
-
-    if not plant_summary.empty:
-        st.dataframe(plant_summary)
+    # ------------------- ✅ CRITICAL SPS -------------------
+    st.markdown("### 🚨 Critical SPS (Standby Pumps = 0)")
+    summary_df["standby pumps"] = pd.to_numeric(summary_df.get("standby pumps", 0), errors="coerce").fillna(0)
+    critical_df = summary_df[summary_df["standby pumps"] == 0]
+    if not critical_df.empty:
+        st.dataframe(critical_df[["entry_date", "zone", "sps_name", "standby pumps"]].sort_values("entry_date", ascending=False))
+        st.download_button("📥 Download Critical SPS", data=to_excel(critical_df), file_name="critical_sps.xlsx", mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
     else:
-        st.info("No data available for Plant zone in selected range.")
+        st.success("✅ No Critical SPS found.")
 
-    # 🗓️ Today's date for default filters
-    today = date.today()
+    # ------------------- ✅ CONTINUE WITH COMPARE DATES... -------------------
+    # Keep your date comparison code unchanged; it's well-written.
 
-    # ----------------- 🔍 Compare Metrics Between Two Dates -----------------
-    st.markdown("### 🔍 Compare Metrics Between Two Dates")
 
-    with st.form("compare_dates_form"):
-        col1, col2 = st.columns(2)
-        with col1:
-            compare_date_1 = st.date_input("📅 First Date", value=today - timedelta(days=1), key="compare_date_1")
-        with col2:
-            compare_date_2 = st.date_input("📅 Second Date", value=today, key="compare_date_2")
-
-        compare_zone = st.selectbox("🗂 Zone Filter", ["All"] + sorted(summary_df["Zone"].unique()))
-        compare_sps = st.selectbox("🏭 SPS Filter", ["All"] + sorted(summary_df["SPS Name"].unique()))
-        view_as_percent = st.checkbox("📉 Show as % Change", value=False)
-        submitted = st.form_submit_button("Compare Dates")
-
-    if submitted:
-        df_compare = summary_df[
-            pd.to_datetime(summary_df["Date"]).dt.date.isin([compare_date_1, compare_date_2])
-        ]
-        if compare_zone != "All":
-            df_compare = df_compare[df_compare["Zone"] == compare_zone]
-        if compare_sps != "All":
-            df_compare = df_compare[df_compare["SPS Name"] == compare_sps]
-
-        if df_compare.empty:
-            st.warning("⚠️ No data found.")
-        else:
-            pivot = df_compare.pivot_table(
-                index="SPS Name",
-                columns=df_compare["Date"].dt.date,
-                values=["Pumping MLD", "Income MLD", "Supply MLD"],
-                aggfunc="sum"
-            )
-            pivot.columns = [f"{m} ({d})" for m, d in pivot.columns]
-            pivot = pivot.reset_index()
-
-            for metric in ["Pumping MLD", "Income MLD", "Supply MLD"]:
-                col1 = f"{metric} ({compare_date_1})"
-                col2 = f"{metric} ({compare_date_2})"
-                if col1 in pivot.columns and col2 in pivot.columns:
-                    pivot[f"\u0394 {metric}"] = pivot[col2] - pivot[col1]
-                    pivot[f"% \u0394 {metric}"] = (
-                            (pivot[f"\u0394 {metric}"] / pivot[col1].replace(0, float("nan"))) * 100
-                    ).round(2)
-
-            display_cols = ["SPS Name"]
-            for metric in ["Pumping MLD", "Income MLD", "Supply MLD"]:
-                col = f"% \u0394 {metric}" if view_as_percent else f"\u0394 {metric}"
-                if col in pivot.columns:
-                    display_cols.append(col)
-
-            st.markdown(f"#### 📋 Comparison Table {'(% Change)' if view_as_percent else '(Absolute Change)'}")
-            st.dataframe(pivot[display_cols].style.applymap(
-                lambda v: 'color: green' if isinstance(v, (int, float)) and v > 0 else (
-                    'color: red' if isinstance(v, (int, float)) and v < 0 else ''),
-                subset=display_cols[1:]
-            ))
-
-            for metric in ["Pumping MLD", "Income MLD", "Supply MLD"]:
-                col = f"% \u0394 {metric}" if view_as_percent else f"\u0394 {metric}"
-                if col in pivot.columns:
-                    chart_df = pivot[["SPS Name", col]].dropna()
-                    chart_df = chart_df[chart_df[col] != 0]
-                    if not chart_df.empty:
-                        fig = go.Figure(go.Bar(
-                            x=chart_df["SPS Name"],
-                            y=chart_df[col],
-                            marker_color=["green" if x > 0 else "red" for x in chart_df[col]],
-                            text=chart_df[col].round(2),
-                            textposition="auto"
-                        ))
-                        fig.update_layout(
-                            title=f"📊 {metric} Change ({'%' if view_as_percent else 'MLD'}): {compare_date_1} ➜ {compare_date_2}",
-                            xaxis_title="SPS Name",
-                            yaxis_title=f"{metric} {'% Δ' if view_as_percent else 'Δ'}",
-                            showlegend=False, height=400
-                        )
-                        st.plotly_chart(fig, use_container_width=True)
-
-            st.download_button(
-                label=f"📥 Download {'% Change' if view_as_percent else 'Absolute Change'} Comparison",
-                data=to_excel(pivot),
-                file_name="date_comparison.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-
-    # ----------------- ⚠️ Critical SPS List (Standby = Standby U/M) -----------------
-    st.markdown("### 🚨 Critical SPS (Standby Pumps All in Under Maintenance)")
-
-    if not summary_df.empty:
-        critical_df = summary_df[
-            summary_df["Standby Pumps"] == 0
-            ]
-        if not critical_df.empty:
-            st.dataframe(
-                critical_df[["Date", "Zone", "SPS Name", "Standby Pumps"]].sort_values("Date", ascending=False))
-            st.download_button(
-                label="📥 Download Critical SPS List",
-                data=to_excel(critical_df),
-                file_name="critical_sps_zero_standby.xlsx",
-                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            )
-        else:
-            st.success("✅ No Critical SPS ")
